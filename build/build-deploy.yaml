@@ -1,0 +1,364 @@
+---
+on:
+  workflow_call:
+    inputs:
+      AWS_ECR_HOSTNAME:
+        description: >-
+          Provide an AWS ECR repo; get list via `aws ecr describe-repositories`; example:
+          `01234567890.dkr.ecr.eu-west-1.amazonaws.com`
+        required: true
+        type: string
+      AWS_ECR_REPO:
+        description: >-
+          Provide an AWS ECR repo; get list via `aws ecr describe-repositories`; example: `notification-service`
+        required: true
+        type: string
+      AWS_ECS_CLUSTER:
+        description: >-
+          Provide an AWS ECS cluster; get list via `aws ecs list-clusters`; example: `firetail-sandbox-eu-west-1-ecs`
+        required: true
+        type: string
+      AWS_ECS_SERVICE:
+        description: >-
+          Provide an AWS ECS service; get list via `aws ecs list-services`; example: `notification-service-service`
+        required: true
+        type: string
+      AWS_ECS_TASK_DEF:
+        description: >-
+          Provide an ECS task definition; get list via `aws ecs list-task-definitions`; example:
+          `notification-service-task`
+        required: true
+        type: string
+      AWS_ECS_TASK_DEF_ENV_VARS:
+        description: >-
+          Provide a newline-delimited list of variables for the container runtime environment; example: `FOO=bar`
+        required: false
+        type: string
+      AWS_REGION:
+        description: >-
+          Provide AWS region; example: `eu-west-1`
+        required: true
+        type: string
+      AWS_ROLE:
+        description: >-
+          Provide an AWS role-to-assume; get list via `aws iam list-roles`; example:
+          `arn:aws:iam::0123456789012:role/firetail-sandbox-github-some-service`
+        required: true
+        type: string
+      DEPLOYMENT_ENV:
+        description: >-
+          Use the prod environment for prod deployments; link to docs in the README; example: `prod`
+        required: true
+        type: string
+      DOCKER_MANUAL_IMAGE_TAG:
+        description: >-
+          Provide a tag if not enabling the event context image tag; example: 'v1.0.0'
+        required: false
+        type: string
+      ENABLE_AUTO_TAG:
+        description: >-
+          Elect to use the triggering github event context as the image tag; the workflow uses the tag if the ref type
+          is a tag, else the SHA
+        required: true
+        type: boolean
+      ENABLE_ARTIFACT_DOWNLOAD:
+        description: >-
+          Elect to download the image from a workflow run
+        required: true
+        type: boolean
+      ENABLE_RELEASE_DOWNLOAD:
+        description: >-
+          Elect to download the image from a release
+        required: true
+        type: boolean
+      RUNS_ON:
+        default: ubuntu-latest
+        description: >-
+          Allows for upgrading to larger runner if needed; example: 'ubuntu-latest-8-cores'
+        required: false
+        type: string
+      TIMEOUT_MINUTES:
+        description: >-
+          Stop the workflow run if the job exceeds the timeout; example: `10`
+        required: false
+        type: number
+    outputs:
+      NEW_TASK_DEF_REV_ARN:
+        value: ${{jobs.deploy-image.outputs.NEW_TASK_DEF_REV_ARN}}
+jobs:
+  deploy-image:
+    environment: ${{inputs.DEPLOYMENT_ENV}}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    runs-on: ${{inputs.RUNS_ON}}
+    timeout-minutes: ${{inputs.TIMEOUT_MINUTES}}
+    defaults:
+      run:
+        shell: bash --noprofile --norc -o errexit -o pipefail -o nounset {0}
+    env:
+      AWS_ECR_HOSTNAME: ${{inputs.AWS_ECR_HOSTNAME}}
+      AWS_ECR_REPO: ${{inputs.AWS_ECR_REPO}}
+      AWS_ECS_CLUSTER: ${{inputs.AWS_ECS_CLUSTER}}
+      AWS_ECS_SERVICE: ${{inputs.AWS_ECS_SERVICE}}
+      AWS_ECS_TASK_DEF: ${{inputs.AWS_ECS_TASK_DEF}}
+      AWS_ECS_TASK_DEF_ENV_VARS: ${{inputs.AWS_ECS_TASK_DEF_ENV_VARS}}
+      DOCKER_MANUAL_IMAGE_TAG: ${{inputs.DOCKER_MANUAL_IMAGE_TAG}}
+      DOCKER_IMAGE_TYPE: docker
+    outputs:
+      NEW_TASK_DEF_REV_ARN: ${{steps.update-ecs-task-definition.outputs.NEW_TASK_DEF_REV_ARN}}
+    steps:
+      - name: Show Inputs
+        env:
+          INPUTS: ${{toJSON(inputs)}}
+        run: |-
+          cat <<HEREDOC >>"${GITHUB_STEP_SUMMARY}"
+          ### Workflow Inputs
+          \`\`\`yaml
+          $(yq --prettyPrint <<<"${INPUTS}")
+          \`\`\`
+          HEREDOC
+      - name: Error If No Path to Tag Provided
+        # wrap in brackets b/c YAML string can't start with exclamation mark
+        if: ${{!inputs.ENABLE_AUTO_TAG && !inputs.DOCKER_MANUAL_IMAGE_TAG}}
+        run: |-
+          error_title='INVALID INPUT'
+          error_msg='ENABLE_AUTO_TAG disabled and no DOCKER_MANUAL_IMAGE_TAG provided'
+          echo "::error title=${error_title} input::${error_msg}"
+          exit 1
+      - name: Warn if Tag Provided and Auto Tag Enabled
+        if: ${{inputs.ENABLE_AUTO_TAG && inputs.DOCKER_MANUAL_IMAGE_TAG}}
+        run: |-
+          warning_title='MISMATCHED INPUT'
+          warning_msg=(
+            'ENABLE_AUTO_TAG enabled and DOCKER_MANUAL_IMAGE_TAG provided; '
+            "proceeding with DOCKER_MANUAL_IMAGE_TAG value: ${DOCKER_MANUAL_IMAGE_TAG}"
+          )
+          echo "::warning title=${warning_title} input::${warning_msg[*]}"
+      - name: Warn if Artifact and Release Downlad Enabled
+        if: ${{inputs.ENABLE_ARTIFACT_DOWNLOAD && inputs.ENABLE_RELEASE_DOWNLOAD}}
+        run: |-
+          warning_title='MISMATCHED INPUT'
+          warning_msg=(
+            'ENABLE_ARTIFACT_DOWNLOAD and ENABLE_RELEASE_DOWNLOAD'
+            'both enabled; release will clobber artifact'
+          )
+          echo "::warning title=${warning_title} input::${warning_msg[*]}"
+      # needed for git rev-parse
+      - name: Checkout Source
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          sparse-checkout: .
+      - name: Use Auto Tag
+        if: ${{inputs.ENABLE_AUTO_TAG}}
+        env:
+          # pull-requests don't use github.sha for some reason
+          COMMIT_SHA: ${{github.event.pull_request.head.sha || github.sha}}
+        run: |-
+          shopt -s nocasematch
+          [[ ${GITHUB_REF_TYPE} == "tag" ]] &&
+            VERSION=${GITHUB_REF_NAME} ||
+            VERSION=$(git rev-parse --short "${COMMIT_SHA}")
+          cat <<HEREDOC >>"${GITHUB_ENV}"
+          VERSION=${VERSION}
+          HEREDOC
+      - name: Use Provided Tag
+        if: ${{inputs.DOCKER_MANUAL_IMAGE_TAG}}
+        run: |-
+          cat <<HEREDOC >>"${GITHUB_ENV}"
+          VERSION=${DOCKER_MANUAL_IMAGE_TAG}
+          HEREDOC
+      - name: Download Image From Workflow Artifacts
+        if: ${{inputs.ENABLE_ARTIFACT_DOWNLOAD}}
+        env:
+          GITHUB_TOKEN: ${{github.token}}
+        run: |-
+          gh run download "${GITHUB_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "checksum-${VERSION}"
+          gh run download "${GITHUB_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "${AWS_ECR_REPO}-${VERSION}.${DOCKER_IMAGE_TYPE}"
+      - name: Download Image From Release Assets
+        if: ${{inputs.ENABLE_RELEASE_DOWNLOAD}}
+        env:
+          GITHUB_TOKEN: ${{github.token}}
+        run: |-
+          gh release download "${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+      - name: Verify Image Checksum
+        run: |-
+          sha256sum --check "checksum-${VERSION}"
+      - name: Load Image To Docker
+        run: |-
+          docker image load \
+            --input "${AWS_ECR_REPO}-${VERSION}.${DOCKER_IMAGE_TYPE}"
+      - name: Tag Image With Full URI
+        run: |-
+          docker image tag "${AWS_ECR_REPO}:${VERSION}" \
+            "${AWS_ECR_HOSTNAME}/${AWS_ECR_REPO}:${VERSION}"
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a # v4.0.1
+        with:
+          aws-region: ${{inputs.AWS_REGION}}
+          role-to-assume: ${{inputs.AWS_ROLE}}
+          role-session-name: github-${{inputs.AWS_ECR_REPO}}-deploy-${{env.VERSION}}
+      - name: Log In to Amazon ECR
+        run: |-
+          aws ecr get-login-password |
+            docker login \
+              --username AWS \
+              --password-stdin \
+              "${AWS_ECR_HOSTNAME}"
+      - name: Push Image To ECR
+        run: |-
+          docker image push "${AWS_ECR_HOSTNAME}/${AWS_ECR_REPO}:${VERSION}"
+      - name: Convert Deployment Env Vars to JSON
+        run: |-
+          # forcing true because -d '' causes non-zero exit
+          read -rd '' -a env_vars_array \
+            <<<"${AWS_ECS_TASK_DEF_ENV_VARS}" || true
+          # [{"name":"FOO","value":"bar,...}] format is required by ECS
+          NEW_ENV_VAR_JSON_ENTRIES="$(
+            for ((i = 0; i < ${#env_vars_array[@]}; i++)); do
+              name="${env_vars_array[i]%%=*}"
+              value="${env_vars_array[i]#*=}"
+              ((i == 0)) && printf "["
+              printf '{"name":"%s","value":"%s"}' "${name}" "${value}"
+              ((i + 1 < ${#env_vars_array[@]})) &&
+                printf "," ||
+                printf "]\n"
+            done
+          )"
+          cat <<HEREDOC >>"${GITHUB_ENV}"
+          NEW_ENV_VAR_JSON_ENTRIES=${NEW_ENV_VAR_JSON_ENTRIES}
+          HEREDOC
+      - name: Merge Environment Variables
+        run: |-
+          OLD_TASK_DEF="$(
+            aws ecs describe-task-definition \
+              --task-definition "${AWS_ECS_TASK_DEF}"
+          )"
+          printf "::group::%s\n%s\n::endgroup::\n" \
+            'OLD_TASK_DEF' \
+            "$(jq --color-output <<<"${OLD_TASK_DEF}" ||
+              echo "${OLD_TASK_DEF}")"
+          old_env_var_json_entries="$(
+            jq --null-input --argjson input "${OLD_TASK_DEF}" \
+              '$input.taskDefinition.containerDefinitions[0].environment'
+          )"
+          printf "::group::%s\n%s\n::endgroup::\n" \
+            'old_env_var_json_entries' \
+            "$(jq --color-output <<<"${old_env_var_json_entries}" ||
+              echo "${old_env_var_json_entries}")"
+          # precedence is left-to-right
+          MERGED_ENV_VAR_JSON_ENTRIES="$(
+            jq --null-input \
+              --argjson new "${NEW_ENV_VAR_JSON_ENTRIES}" \
+              --argjson old "${old_env_var_json_entries}" \
+              '[{name:"RELEASE_VERSION",value:$ENV.VERSION}] + $new + $old |
+              unique_by(.name) | sort_by(.name)'
+          )"
+          printf "::group::%s\n%s\n::endgroup::\n" \
+            'MERGED_ENV_VAR_JSON_ENTRIES' \
+            "$(jq --color-output <<<"${MERGED_ENV_VAR_JSON_ENTRIES}" ||
+              echo "${MERGED_ENV_VAR_JSON_ENTRIES}")"
+          single_line_old_task_def="$(
+            jq --compact-output <<<"${OLD_TASK_DEF}"
+          )"
+          single_line_merged_env_var_json_entries="$(
+            jq --compact-output <<<"${MERGED_ENV_VAR_JSON_ENTRIES}"
+          )"
+          cat <<HEREDOC >>"${GITHUB_ENV}"
+          OLD_TASK_DEF=${single_line_old_task_def}
+          MERGED_ENV_VAR_JSON_ENTRIES=${single_line_merged_env_var_json_entries}
+          HEREDOC
+      - name: Update ECS Task Definition
+        id: update-ecs-task-definition
+        run: |-
+          # Update env vars and image, then pass through enumerated properties
+          new_task_def_input="$(
+            jq --null-input --sort-keys \
+              --argjson OLD_TASK_DEF "${OLD_TASK_DEF}" \
+              --argjson MERGED_ENV_VAR_JSON_ENTRIES "${MERGED_ENV_VAR_JSON_ENTRIES}" \
+              --arg full_image "${AWS_ECR_HOSTNAME}/${AWS_ECR_REPO}:${VERSION}" \
+              '$OLD_TASK_DEF.taskDefinition |
+              (.containerDefinitions[0]).environment = $MERGED_ENV_VAR_JSON_ENTRIES |
+              (.containerDefinitions[0]).image = $full_image |
+              {
+                containerDefinitions,
+                cpu,
+                executionRoleArn,
+                family,
+                memory,
+                networkMode,
+                placementConstraints,
+                requiresCompatibilities,
+                taskRoleArn,
+                volumes
+              }'
+          )"
+          printf "::group::%s\n%s\n::endgroup::\n" \
+            'new_task_def_input' \
+            "$(jq --color-output <<<"${new_task_def_input}" ||
+              echo "${new_task_def_input}")"
+          reg_new_task_def_output="$(
+            aws ecs register-task-definition \
+              --cli-input-json "${new_task_def_input}"
+          )"
+          printf "::group::%s\n%s\n::endgroup::\n" \
+            'reg_new_task_def_output' \
+            "$(jq --color-output <<<"${OLD_TASK_DEF}" ||
+              echo "${OLD_TASK_DEF}")"
+          NEW_TASK_DEF_REV_ARN="$(
+            jq --null-input --raw-output \
+              --argjson input "${reg_new_task_def_output}" \
+              '$input.taskDefinition.taskDefinitionArn'
+          )"
+          cat <<HEREDOC | tee -a "${GITHUB_ENV}" >>"${GITHUB_OUTPUT}"
+          NEW_TASK_DEF_REV_ARN=${NEW_TASK_DEF_REV_ARN}
+          HEREDOC
+      - name: Force Replace Task
+        run: |-
+          ecs_update_service_output="$(
+            aws ecs update-service \
+              --cluster "${AWS_ECS_CLUSTER}" \
+              --service "${AWS_ECS_SERVICE}" \
+              --task-definition "${NEW_TASK_DEF_REV_ARN}" \
+              --force-new-deployment
+          )"
+          printf "::group::%s\n%s\n::endgroup::\n" \
+            'ecs_update_service_output' \
+            "$(jq --color-output <<<"${ecs_update_service_output}" ||
+              echo "${ecs_update_service_output}")"
+          jq --exit-status --argjson input "${ecs_update_service_output}" \
+            '$input.service.taskDefinition == $ENV.NEW_TASK_DEF_REV_ARN'
+      - name: Show AWS Confirmation Command
+        run: |-
+          cat <<HEREDOC >>"${GITHUB_STEP_SUMMARY}"
+          ### ECS Deployment Confirmation Command
+          [Property Descriptions](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_Deployment.html)
+          \`\`\`shell
+          aws ecs describe-services \\
+            --cluster "${AWS_ECS_CLUSTER}" \\
+            --services "${AWS_ECS_SERVICE}" |
+            jq '.services[].deployments[] |
+              select(.taskDefinition == "$NEW_TASK_DEF_REV_ARN")'
+          \`\`\`
+          HEREDOC
+  show-outputs:
+    needs: deploy-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show Outputs
+        env:
+          OUTPUTS: ${{toJSON(needs.deploy-image.outputs)}}
+        run: |-
+          cat <<HEREDOC >>"${GITHUB_STEP_SUMMARY}"
+          ### Workflow Outputs
+          \`\`\`yaml
+          $(yq --prettyPrint <<<"${OUTPUTS}")
+          \`\`\`
+          HEREDOC
