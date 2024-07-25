@@ -1,0 +1,46 @@
+name: Sample
+on:
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: docker build test-image
+        run: |-
+          docker buildx build --load \
+            --target test-image \
+            --file build/dockerfile \
+            --tag app:test-image \
+            .
+      - name: docker run test-image
+        run: |-
+          docker container run --rm \
+            --tag app:test-image
+      - name: docker build runtime-image
+        run: |-
+          docker buildx build --load \
+            --target runtime-image \
+            --file build/dockerfile \
+            --tag app:latest \
+            .
+      - name: docker login
+        run: |-
+          aws ecr get-login-password |
+            docker login \
+            --username AWS \
+            --password-stdin \
+            01234567890.dkr.ecr.eu-west-1.amazonaws.com
+      - name: docker image tag
+        run: |-
+          docker image tag \
+            app:latest \
+            01234567890.dkr.ecr.eu-west-1.amazonaws.com/app:latest
+          docker tag \
+            app:latest \
+            01234567890.dkr.ecr.eu-west-1.amazonaws.com/app:v1.2.3
+      - name: docker image push
+        run: |-
+          docker image push \
+            01234567890.dkr.ecr.eu-west-1.amazonaws.com/app:latest
+          docker push \
+            01234567890.dkr.ecr.eu-west-1.amazonaws.com/app:v1.2.3
